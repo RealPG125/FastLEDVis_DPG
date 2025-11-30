@@ -7,6 +7,8 @@ import time
 import threading
 import colorsys
 import serial
+import cv2
+from windows_capture import WindowsCapture, Frame, InternalCaptureControl
 from multiprocessing.dummy import Pool as ThreadPool
 from concurrent.futures import ThreadPoolExecutor
 from scipy.signal import butter, lfilter
@@ -15,9 +17,15 @@ from scipy.signal import butter, lfilter
 
 ### system
 # init audio stream
-CHUNK = 1024
+CHUNK = 512
 RATE = 48000
 DEVICE_ID = 50 # 3: mme, 22: wds, 50: wasapi
+COLOR_BAND_SIZE = 64
+
+LED_COUNT = 144
+
+SCREEN_WIDTH = 3840
+SCREEN_HEIGHT = 2160
 
 pa = pyaudio.PyAudio()
 
@@ -39,7 +47,20 @@ if not stream.is_active():
 ### vars
 # system
 fps = 60
-colorBandSize = 64
+bakeMode = 0
+captureBand = 12
+captureBlocks = 24
+captureStatus = 0
+captureX = np.array([i / captureBand for i in range(captureBand)])
+captureXBand = np.array([i / COLOR_BAND_SIZE for i in range(COLOR_BAND_SIZE)])
+colorContributionThreshold = 0.33
+colorContributionRatio = 0.7
+colorValueThreshold = 32
+colorValueCut = 0.85
+colorTransitionSpeed = 1.0
+colorCalibrationR = 0.96
+colorCalibrationG = 1.0
+colorCalibrationB = 0.91
 
 # audio analysis
 useOrder = 1
@@ -59,14 +80,16 @@ velocity = np.empty(bars, dtype = int)
 rawHeight = np.full(bars, 1, dtype = int)
 rawHeightPrev = rawHeight.copy()
 height = np.full(bars, 1, dtype = int)
-gradientR = np.full(colorBandSize, 0, dtype = int)
-gradientG = np.full(colorBandSize, 0, dtype = int)
-gradientB = np.full(colorBandSize, 0, dtype = int)
+gradientR = np.full(COLOR_BAND_SIZE, 0, dtype = int)
+gradientG = np.full(COLOR_BAND_SIZE, 0, dtype = int)
+gradientB = np.full(COLOR_BAND_SIZE, 0, dtype = int)
 exponentialDecay = 0.08
 exponentBase = 125
 decaySpeed = 0.16
 powerMultiplier = 0.875
+powerOffset = 0
 pumpThreshold = 12
+pumpHeightThreshold = 0
 
 # layers
 baseMode = 1
@@ -82,7 +105,7 @@ base_rainbowStart = 0.0
 base_rainbowEnd = 1.0
 base_breathingSpeed = 1.0
 baseSat = 0.6
-layerOffset = 5
+layerOffset = 0
 layerHue = 0.5
 layerSat = 1
 layer_sideOrientation = 1
@@ -96,15 +119,19 @@ preset = 0
 
 # colors
 base_rainbowHue = 0.0
-baseRGB = [(0,0,0)] * colorBandSize
-layerRGB = [(0,0,0)] * colorBandSize
-layerMask = [0.0] * colorBandSize
+baseRGB = [(0,0,0)] * COLOR_BAND_SIZE
+baseR = [0] * COLOR_BAND_SIZE
+baseG = [0] * COLOR_BAND_SIZE
+baseB = [0] * COLOR_BAND_SIZE
+layerRGB = [(0,0,0)] * COLOR_BAND_SIZE
+layerMask = [0.0] * COLOR_BAND_SIZE
+columnAverageColor = [[0,0,0] for _ in range(captureBand)]
 
 # ui
 baseYPos = 150
 baseModeDict = {0: "Rainbow", 1: "Static", 2: "Breathing"}
 layerModeDict = {0: "One Side", 1: "Middle", 2: "Pulse"}
-renderModeDict = {0: "Audio Reactive", 1: "Custom Pattern"}
+bakeModeDict = {0: "Audio", 1: "Screen Capture"}
 
 # flags
 running = True
@@ -116,10 +143,80 @@ for i in range(len(shortWaveform)):
     shortWaveformx.append(i)
 
 # LED
-ledCount = 144
 ledSerial = serial.Serial("COM9", 460800)
 ledVignetteMultiplier = 0.0
 ledVignettePower = 0.0
+
+
+
+## screen capture init
+capture = WindowsCapture(
+    cursor_capture = None,
+    draw_border = False,
+    monitor_index = 1,
+    window_name = None,
+)
+
+@capture.event
+def on_frame_arrived(frame: Frame, capture_control: InternalCaptureControl):
+    global captureStatus
+    global baseR
+    global baseG
+    global baseB  
+
+    if (captureStatus == 0):
+        capture_control.stop()
+
+    else:
+        frameBuffer = frame.frame_buffer.view()
+
+        for i in range(captureBand):
+            columnAverageColor[i][0] = 0
+            columnAverageColor[i][1] = 0
+            columnAverageColor[i][2] = 0
+
+        for i in range(captureBand):
+            activeBlocks = captureBlocks
+            
+            for j in range(captureBlocks):
+                columnAverageColorR = int(frameBuffer[j * int(SCREEN_HEIGHT / captureBlocks)][i * int(SCREEN_WIDTH / captureBand)][0])
+                columnAverageColorG = int(frameBuffer[j * int(SCREEN_HEIGHT / captureBlocks)][i * int(SCREEN_WIDTH / captureBand)][1])
+                columnAverageColorB = int(frameBuffer[j * int(SCREEN_HEIGHT / captureBlocks)][i * int(SCREEN_WIDTH / captureBand)][2])
+
+                if ((max(columnAverageColorR, columnAverageColorG, columnAverageColorB) - min(columnAverageColorR, columnAverageColorG, columnAverageColorB)) / max(columnAverageColorR, columnAverageColorG, columnAverageColorB, 1) < colorContributionThreshold):
+                    columnAverageColorR *= colorContributionRatio
+                    columnAverageColorG *= colorContributionRatio
+                    columnAverageColorB *= colorContributionRatio
+                
+                if (((columnAverageColorR + columnAverageColorG + columnAverageColorB) / 3 < colorValueThreshold) and (activeBlocks > colorValueCut)):
+                    activeBlocks -= colorValueCut
+
+                columnAverageColor[i][0] += columnAverageColorR
+                columnAverageColor[i][1] += columnAverageColorG
+                columnAverageColor[i][2] += columnAverageColorB
+
+            columnAverageColor[i][0] /= activeBlocks
+            columnAverageColor[i][1] /= activeBlocks
+            columnAverageColor[i][2] /= activeBlocks
+
+            # (shadow boost)
+            columnGamma = pow((columnAverageColor[i][0] + columnAverageColor[i][1] + columnAverageColor[i][2]) / (3 * 255), 0.4)
+
+            columnAverageColor[i][0] *= (1 + columnGamma)
+            columnAverageColor[i][1] *= (1 + columnGamma)
+            columnAverageColor[i][2] *= (1 + columnGamma)
+
+    baseR = np.interp(captureXBand, captureX, np.array([columnAverageColor[i][2] for i in range(captureBand)]))
+    baseG = np.interp(captureXBand, captureX, np.array([columnAverageColor[i][1] for i in range(captureBand)]))
+    baseB = np.interp(captureXBand, captureX, np.array([columnAverageColor[i][0] for i in range(captureBand)]))
+
+    time.sleep(2 / fps)
+
+@capture.event
+def on_closed():
+    global captureStatus
+
+    captureStatus = 0
 
 
 
@@ -162,15 +259,17 @@ def bars_update():
     for i in range(bars):
         # ver1 compare
         # if (rawHeight[i] > height[i]):
-
+        
         # ver2 delta smoothened 
         # if (rawHeight[i] - height[i] > pumpThreshold):
         
         # ver3 delta raw
-        if (rawHeight[i] - rawHeightPrev[i] > pumpThreshold):
-            velocity[i] = rawHeight[i] * powerMultiplier
+        if ((rawHeight[i] - rawHeightPrev[i] > pumpThreshold) and rawHeight[i] > pumpHeightThreshold):
+            velocity[i] = rawHeight[i] * powerMultiplier + powerOffset
+
         height[i] += velocity[i]
-        height[i] -= exponentialDecay * height[i]
+        height[i] -= exponentialDecay * height[i] / powerMultiplier
+
         if (height[i] <= 1 or height[i] > 1000):
             height[i] = 1
         else:
@@ -181,25 +280,30 @@ def waveform_update():
 
 # system
 def frame():
-    match baseMode:
+    match bakeMode:
         case 0:
-            LED_update_base_rainbow()
+            match baseMode:
+                case 0:
+                    LED_update_base_rainbow()
+                case 1:
+                    LED_update_base_static()
+                case 2:
+                    LED_update_base_breathing()
+            
+            match layerMode:
+                case 0:
+                    LED_update_layer_lows()
+                case 1:
+                    LED_update_layer_centered_wave()
+                case 2:
+                    LED_update_layer_pulse()
+
+            bars_update()
+            waveform_update()
+
         case 1:
-            LED_update_base_static()
-        case 2:
-            LED_update_base_breathing()
+            LED_update_base_screen()
     
-    match layerMode:
-        case 0:
-            LED_update_layer_lows()
-        case 1:
-            LED_update_layer_centered_wave()
-        case 2:
-            LED_update_layer_pulse()
-
-    bars_update()
-    waveform_update()
-
     LED_bake()
     simulated_LED_update()
     LED_update()
@@ -212,20 +316,25 @@ def frame():
     dpg.configure_item("window_size_text", text = f"window size: {dpg.get_item_width('main_window')}x{dpg.get_item_height('main_window')}", size = 15)
 
 def exit_program():
+    global captureStatus
+
     print("exiting program...")
+
     stream.stop_stream()
     dpg.destroy_context()
     quit()
 
 def update_properties():
-    global renderMode
+    global bakeMode
     global fps
     global useOrder
     global referenceBar
     global decaySpeed
     global powerMultiplier
+    global powerOffset
     global exponentialDecay
     global pumpThreshold
+    global pumpHeightThreshold
     global layerPower
     global layerMultiplier
     global baseMultiplier
@@ -248,14 +357,25 @@ def update_properties():
     global ledVignettePower
     global ledVignetteMultiplier
     global ledPatternBrightness
+    global colorContributionThreshold
+    global colorContributionRatio
+    global colorValueThreshold
+    global colorValueCut
+    global colorTransitionSpeed
+    global colorCalibrationR
+    global colorCalibrationG
+    global colorCalibrationB
 
+    bakeMode = dpg.get_value(bakeModeSlider)
     fps = dpg.get_value(fpsSlider)
     useOrder = dpg.get_value(filterOrderSlider)
     referenceBar = dpg.get_value(referenceBarSlider)
     decaySpeed = dpg.get_value(decaySpeedSlider)
     powerMultiplier = dpg.get_value(powerMultiplierSlider)
+    powerOffset = dpg.get_value(powerOffsetSlider)
     exponentialDecay = dpg.get_value(exponentialDecaySlider)
     pumpThreshold = dpg.get_value(pumpThresholdSlider)
+    pumpHeightThreshold = dpg.get_value(pumpHeightThresholdSlider)
     layerPower = dpg.get_value(layerPowerSlider)
     layerMultiplier = dpg.get_value(layerMultiplierSlider)
     baseMultiplier = dpg.get_value(baseMultiplierSlider)
@@ -276,11 +396,33 @@ def update_properties():
     base_rainbowEnd = dpg.get_value(base_rainbowEndSlider)
     ledVignettePower = dpg.get_value(ledVignettePowerSlider)
     ledVignetteMultiplier = dpg.get_value(ledVignetteMultiplierSlider)
+    colorContributionThreshold = dpg.get_value(colorContributionThresholdSlider)
+    colorContributionRatio = dpg.get_value(colorContributionRatioSlider)
+    colorValueThreshold = dpg.get_value(colorValueThresholdSlider)
+    colorValueCut = dpg.get_value(colorValueCutSlider)
+    colorTransitionSpeed = dpg.get_value(colorTransitionSpeedSlider)
+    colorCalibrationR = dpg.get_value(colorCalibrationRSlider)
+    colorCalibrationG = dpg.get_value(colorCalibrationGSlider)
+    colorCalibrationB = dpg.get_value(colorCalibrationBSlider)
 
     dpg.configure_item("reference_bar_line", p1 = (15 + 15 * referenceBar, baseYPos), p2 = (15 + 15 * referenceBar, 20))
     dpg.configure_item("reference_bar_pulse_threshold_line", p1 = (10 + 15 * referenceBar, baseYPos - layer_pulseThreshold), p2 = (20 + 15 * referenceBar, baseYPos - layer_pulseThreshold))
 
     bandpass_coefficients()
+
+def update_bake_mode():
+    global captureStatus
+
+    update_properties()
+
+    if (bakeMode == 1 and captureStatus == 0):
+        captureStatus = 1
+        capture.start_free_threaded()
+
+    elif (bakeMode == 0):
+        captureStatus = 0
+
+
 
 # patterns
 # base
@@ -293,18 +435,25 @@ def LED_update_base_rainbow():
     base_rainbowHue += base_rainbowSpeed
 
     if (base_rainbowStart == 0 and base_rainbowEnd == 1):
-        for i in range(colorBandSize):
-            baseRGB[i] = colorsys.hsv_to_rgb(base_rainbowStart + ((base_rainbowEnd - base_rainbowStart) * ((i + base_rainbowHue) * base_rainbowScale / colorBandSize)), baseSat, 255 * baseMultiplier)
+        for i in range(COLOR_BAND_SIZE):
+            baseRGB[i] = colorsys.hsv_to_rgb(base_rainbowStart + ((base_rainbowEnd - base_rainbowStart) * ((i + base_rainbowHue) * base_rainbowScale / COLOR_BAND_SIZE)), baseSat, 255 * baseMultiplier)
     else:
-        for i in range(colorBandSize):
-            baseRGB[i] = colorsys.hsv_to_rgb(base_rainbowStart + (((base_rainbowEnd - base_rainbowStart) * abs(((2 * ((i + base_rainbowHue) * base_rainbowScale / colorBandSize)) % 2) - 1))), baseSat, 255 * baseMultiplier)
+        for i in range(COLOR_BAND_SIZE):
+            baseRGB[i] = colorsys.hsv_to_rgb(base_rainbowStart + (((base_rainbowEnd - base_rainbowStart) * abs(((2 * ((i + base_rainbowHue) * base_rainbowScale / COLOR_BAND_SIZE)) % 2) - 1))), baseSat, 255 * baseMultiplier)
 
 def LED_update_base_static():
-    for i in range(colorBandSize):
+    for i in range(COLOR_BAND_SIZE):
         baseRGB[i] = colorsys.hsv_to_rgb(baseHue, baseSat, baseMultiplier * 255)
 
+def LED_update_base_screen():
+    for i in range(COLOR_BAND_SIZE):
+        # print(baseR[i], baseG[i], baseB[i])
+        ### todo interp #######################################################################
+        # baseRGB[i] = (int(columnAverageColor[int(i * captureBand / COLOR_BAND_SIZE)][0]), int(columnAverageColor[int(i * captureBand / COLOR_BAND_SIZE)][1]), int(columnAverageColor[int(i * captureBand / COLOR_BAND_SIZE)][2]))
+        baseRGB[i] = (baseRGB[i][0] + ((baseR[i] - baseRGB[i][0]) * 3 * colorTransitionSpeed / fps), baseRGB[i][1] + ((baseG[i] - baseRGB[i][1]) * 3 * colorTransitionSpeed / fps), (baseRGB[i][2] + (baseB[i] - baseRGB[i][2]) * 3 * colorTransitionSpeed / fps))
+
 def LED_update_base_breathing():
-    for i in range(colorBandSize):
+    for i in range(COLOR_BAND_SIZE):
         baseRGB[i] = colorsys.hsv_to_rgb(baseHue, baseSat, baseMultiplier * 255 * (np.cos(time.time() * base_breathingSpeed) + 1) / 2)
 
 # presets
@@ -356,33 +505,33 @@ def LED_update_base_preset():
 def LED_update_layer_lows():
     match layer_sideOrientation:
         case 0:
-            for i in range(colorBandSize):
+            for i in range(COLOR_BAND_SIZE):
                 layerRGB[i] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
         case 2:    
-            for i in range(colorBandSize):
-                layerRGB[colorBandSize - i - 1] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
+            for i in range(COLOR_BAND_SIZE):
+                layerRGB[COLOR_BAND_SIZE - i - 1] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
         case 1:
-            for i in range(int(colorBandSize / 2)):
+            for i in range(int(COLOR_BAND_SIZE / 2)):
                 layerRGB[i] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 1275)
-                layerRGB[colorBandSize - i - 1] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 1275)
-    for i in range(colorBandSize):
+                layerRGB[COLOR_BAND_SIZE - i - 1] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 1275)
+    for i in range(COLOR_BAND_SIZE):
         layerMask[i] = 1.0
 
 def LED_update_layer_centered_wave():
-    for i in range(int(colorBandSize / 2)):
-        layerRGB[int(colorBandSize / 2) + i] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
-        layerRGB[int(colorBandSize / 2) - i - 1] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
-    for i in range(colorBandSize):
+    for i in range(int(COLOR_BAND_SIZE / 2)):
+        layerRGB[int(COLOR_BAND_SIZE / 2) + i] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
+        layerRGB[int(COLOR_BAND_SIZE / 2) - i - 1] = colorsys.hsv_to_rgb(layerHue + (layerHueSpread * i), layerSat, min(max((height[referenceBar] * layerPower - i + layerOffset) / 255, 0), 255) * layerMultiplier * 2550)
+    for i in range(COLOR_BAND_SIZE):
         layerMask[i] = 1.0
 
 def LED_update_layer_pulse():
     global layer_pulseState
 
-    for i in range(colorBandSize):
+    for i in range(COLOR_BAND_SIZE):
         layerRGB[i] = colorsys.hsv_to_rgb(layerHue, layerSat, layerMultiplier * 255)
 
-    for i in range(colorBandSize - 1):
-        layerMask[colorBandSize - 1 - i] = layerMask[colorBandSize - 2 - i]
+    for i in range(COLOR_BAND_SIZE - 1):
+        layerMask[COLOR_BAND_SIZE - 1 - i] = layerMask[COLOR_BAND_SIZE - 2 - i]
 
     if ((layer_pulseState == False) and height[referenceBar] >= layer_pulseThreshold):
         layer_pulseState = True
@@ -396,40 +545,40 @@ def LED_update_layer_pulse():
 # LED
 def LED_bake():
     # base
-    for i in range(colorBandSize):
+    for i in range(COLOR_BAND_SIZE):
         gradientR[i] = baseRGB[i][0]
         gradientG[i] = baseRGB[i][1]
         gradientB[i] = baseRGB[i][2]
 
     # layer
-    for i in range(colorBandSize):
+    for i in range(COLOR_BAND_SIZE):
         gradientR[i] += layerRGB[i][0] * layerMask[i] * layerOpacity
         gradientG[i] += layerRGB[i][1] * layerMask[i] * layerOpacity
         gradientB[i] += layerRGB[i][2] * layerMask[i] * layerOpacity
 
     # vignette
-    for i in range(colorBandSize):
-        gradientR[i] = gradientR[i] * (1 - min(abs(((colorBandSize / 2) - i) * ledVignettePower) * ledVignetteMultiplier / (colorBandSize / 2), 1))
-        gradientG[i] = gradientG[i] * (1 - min(abs(((colorBandSize / 2) - i) * ledVignettePower) * ledVignetteMultiplier / (colorBandSize / 2), 1))
-        gradientB[i] = gradientB[i] * (1 - min(abs(((colorBandSize / 2) - i) * ledVignettePower) * ledVignetteMultiplier / (colorBandSize / 2), 1))
+    for i in range(COLOR_BAND_SIZE):
+        gradientR[i] = gradientR[i] * (1 - min(abs(((COLOR_BAND_SIZE / 2) - i) * ledVignettePower) * ledVignetteMultiplier / (COLOR_BAND_SIZE / 2), 1))
+        gradientG[i] = gradientG[i] * (1 - min(abs(((COLOR_BAND_SIZE / 2) - i) * ledVignettePower) * ledVignetteMultiplier / (COLOR_BAND_SIZE / 2), 1))
+        gradientB[i] = gradientB[i] * (1 - min(abs(((COLOR_BAND_SIZE / 2) - i) * ledVignettePower) * ledVignetteMultiplier / (COLOR_BAND_SIZE / 2), 1))
 
-    # cap
-    for i in range(colorBandSize):
-        gradientR[i] = min(max(int(gradientR[i]), 0), 255)
-        gradientG[i] = min(max(int(gradientG[i]), 0), 255)
-        gradientB[i] = min(max(int(gradientB[i]), 0), 255)
+    # cap, calibration
+    for i in range(COLOR_BAND_SIZE):
+        gradientR[i] = min(max(int(gradientR[i]), 0), 255) * colorCalibrationR
+        gradientG[i] = min(max(int(gradientG[i]), 0), 255) * colorCalibrationG
+        gradientB[i] = min(max(int(gradientB[i]), 0), 255) * colorCalibrationB
 
 def simulated_LED_update():
     for i in range(60):
-        dpg.configure_item(f"led60_index{i}", fill = (gradientR[int(i * colorBandSize / 60)], gradientG[int(i * colorBandSize / 60)], gradientB[int(i * colorBandSize / 60)]))
+        dpg.configure_item(f"led60_index{i}", fill = (gradientR[int(i * COLOR_BAND_SIZE / 60)], gradientG[int(i * COLOR_BAND_SIZE / 60)], gradientB[int(i * COLOR_BAND_SIZE / 60)]))
 
     for i in range(144):
-        dpg.configure_item(f"led144_index{i}", fill = (gradientR[int(i * colorBandSize / 144)], gradientG[int(i * colorBandSize / 144)], gradientB[int(i * colorBandSize / 144)]))
+        dpg.configure_item(f"led144_index{i}", fill = (gradientR[int(i * COLOR_BAND_SIZE / 144)], gradientG[int(i * COLOR_BAND_SIZE / 144)], gradientB[int(i * COLOR_BAND_SIZE / 144)]))
 
 def LED_update():
     frame = bytearray()
-    for i in range(ledCount):
-        frame += bytes([gradientR[int(i * colorBandSize / ledCount)], gradientG[int(i * colorBandSize / ledCount)], gradientB[int(i * colorBandSize / ledCount)]])
+    for i in range(LED_COUNT):
+        frame += bytes([gradientR[int(i * COLOR_BAND_SIZE / LED_COUNT)], gradientG[int(i * COLOR_BAND_SIZE / LED_COUNT)], gradientB[int(i * COLOR_BAND_SIZE / LED_COUNT)]])
     ledSerial.write(frame)
 
 # ui
@@ -495,7 +644,7 @@ t.start()
 dpg.create_context()
 
 # windows
-with dpg.window(label = "Main", tag = "main_window", width = 1030, height = 700, pos = (515,0)):
+with dpg.window(label = "Main", tag = "main_window", width = 1030, height = 715, pos = (515,0)):
     dpg.draw_line((15 + 15 * referenceBar, baseYPos), (15 + 15 * referenceBar, 20), color = colorsys.hsv_to_rgb(0.15,0.8,200), tag = "reference_bar_line")
     dpg.draw_line((10 + 15 * referenceBar, baseYPos - layer_pulseThreshold), (20 + 15 * referenceBar, baseYPos - layer_pulseThreshold), color = colorsys.hsv_to_rgb(0.15,0.8,200), tag = "reference_bar_pulse_threshold_line")
     for i in range(bars):
@@ -519,11 +668,16 @@ with dpg.window(label = "Main", tag = "main_window", width = 1030, height = 700,
     anchor += 75
 
     with dpg.child_window(tag = "main_parent_group_1", pos = (30, anchor), border = False, resizable_x = False, width = 515):
+        dpg.add_text(f"bake mode: {bakeModeDict[bakeMode]}", tag = "bake_mode_text")
+        bakeModeSlider = dpg.add_slider_int(label = "bake mode", default_value = bakeMode, min_value = 0, max_value = 1, tag = "bake_mode_action")
+        dpg.add_text("")
         dpg.add_text("bars settings")
         decaySpeedSlider = dpg.add_slider_float(label = "decay speed", default_value = decaySpeed, min_value = 0, max_value = 10, tag = "decay_speed_action")
-        powerMultiplierSlider = dpg.add_slider_float(label = "power multiplier", default_value = powerMultiplier, min_value = 0.25, max_value = 50, tag = "power_multiplier_action")
+        powerMultiplierSlider = dpg.add_slider_float(label = "power multiplier", default_value = powerMultiplier, min_value = 0, max_value = 50, tag = "power_multiplier_action")
+        powerOffsetSlider = dpg.add_slider_float(label = "power offset", default_value = powerOffset, min_value = -50, max_value = 50, tag = "power_offset_action")
         exponentialDecaySlider = dpg.add_slider_float(label = "exponential decay", default_value = exponentialDecay, min_value = 0, max_value = 1, tag = "exponential_decay_action")
         pumpThresholdSlider = dpg.add_slider_int(label = "pump threshold", default_value = pumpThreshold, min_value = 2, max_value = 100, tag = "pump_threshold_action")
+        pumpHeightThresholdSlider = dpg.add_slider_int(label = "pump height cutoff", default_value = pumpHeightThreshold, min_value = 0, max_value = 100, tag = "pump_height_threshold_action")
         filterOrderSlider = dpg.add_slider_int(label = "filter order", default_value = useOrder, min_value = 1, max_value = 3, tag = "filter_order_action")
         referenceBarSlider = dpg.add_slider_int(label = "reference bar", default_value = referenceBar, min_value = 0, max_value = bars - 1, tag = "reference_bar_action")
         dpg.add_text("")
@@ -563,18 +717,29 @@ with dpg.window(label = "Main", tag = "main_window", width = 1030, height = 700,
         dpg.add_text("")
         dpg.add_text("presets")
         presetCombo = dpg.add_combo(label = "select preset", items = ["Purple Rainbow", "Purple Blue Rainbow", "Neon Rainbow", "Redshift Rainbow", "Torch", "Warm", "Calm"], default_value = "Purple Rainbow", tag = "preset_action", callback = LED_update_base_preset)
+        dpg.add_text("")
+        colorContributionThresholdSlider = dpg.add_slider_float(label = "color contribution threshold", default_value = colorContributionThreshold, min_value = 0, max_value = 1, tag = "color_contribution_threshold_action")
+        colorContributionRatioSlider = dpg.add_slider_float(label = "color contribution ratio", default_value = colorContributionRatio, min_value = 0, max_value = 1, tag = "color_contribution_ratio_action")
+        colorValueThresholdSlider = dpg.add_slider_int(label = "color value threshold", default_value = colorValueThreshold, min_value = 0, max_value = 255, tag = "color_value_threshold_action")
+        colorValueCutSlider = dpg.add_slider_float(label = "color value cut", default_value = colorValueCut, min_value = 0, max_value = 1, tag = "color_value_cut_action")
+        colorTransitionSpeedSlider = dpg.add_slider_float(label = "color transition speed", default_value = colorTransitionSpeed, min_value = 0, max_value = 4, tag = "color_transition_speed_action")
+        dpg.add_text("")
+        colorCalibrationRSlider = dpg.add_slider_float(label = "color calibration r", default_value = colorCalibrationR, min_value = 0, max_value = 1, tag = "color_calibration_r_action")
+        colorCalibrationGSlider = dpg.add_slider_float(label = "color calibration g", default_value = colorCalibrationG, min_value = 0, max_value = 1, tag = "color_calibration_g_action")
+        colorCalibrationBSlider = dpg.add_slider_float(label = "color calibration b", default_value = colorCalibrationB, min_value = 0, max_value = 1, tag = "color_calibration_b_action")
+        
     # base individual
     # anchor = dpg.get_item_pos("base_group")[1] + dpg.get_item_rect_size("base_group")[1]
     
 
 
-with dpg.window(label = "Raw", tag = "raw_window", width = 515, height = 700):
+with dpg.window(label = "Raw", tag = "raw_window", width = 515, height = 715):
     for i in range(bars):
         dpg.draw_text((10 + 15 * i, baseYPos + 10), str(rawHeight[i]), color = (250, 250, 250, 255), size = 15, tag = f"height_text_raw{i}")
         dpg.draw_quad((10 + 15 * i, baseYPos), (20 + 15 * i, baseYPos), (20 + 15 * i, baseYPos - rawHeight[i]), (10 + 15 * i, baseYPos - rawHeight[i]), color = (220, 220, 220), tag = f"dynamic_box_raw{i}")
     dpg.draw_text((30, baseYPos + 30), f"current device id: {DEVICE_ID}", color = (250, 250, 250, 255), size = 15)
     dpg.draw_text((30, baseYPos + 50), "frametime: 0ms", color = (250, 250, 250, 255), size = 15, tag = "frametime")
-    fpsSlider = dpg.add_slider_int(label = "target fps", pos = (30, baseYPos + 105), default_value = fps, min_value = 15, max_value = 240, tag = "fps_action")
+    fpsSlider = dpg.add_slider_int(label = "target fps", pos = (30, baseYPos + 105), default_value = fps, min_value = 5, max_value = 240, tag = "fps_action")
     with dpg.plot(label = "waveform", height = 200, width = 455, pos = (30, baseYPos + 130)):
         dpg.add_plot_legend()
         dpg.add_plot_axis(dpg.mvXAxis, label = "sample")
@@ -587,10 +752,13 @@ ui_update_menu_items()
 # handler
 
 handles = {"exit": exit_program, 
+           "bake_mode": update_bake_mode,
            "decay_speed": update_properties,
            "power_multiplier": update_properties,
+           "power_offset": update_properties,
            "exponential_decay": update_properties,
            "pump_threshold": update_properties,
+           "pump_height_threshold": update_properties,
            "filter_order": update_properties,
            "reference_bar": update_properties,
            "layer_mode": ui_update_menu_items,
@@ -615,7 +783,15 @@ handles = {"exit": exit_program,
            "base_rainbow_start": update_properties,
            "base_rainbow_end": update_properties,
            "led_vignette_power": update_properties,
-           "led_vignette_multiplier": update_properties
+           "led_vignette_multiplier": update_properties,
+           "color_contribution_threshold": update_properties,
+           "color_contribution_ratio": update_properties,
+           "color_value_threshold": update_properties,
+           "color_value_cut": update_properties,
+           "color_transition_speed": update_properties,
+           "color_calibration_r": update_properties,
+           "color_calibration_g": update_properties,
+           "color_calibration_b": update_properties,
            }
 
 for handle in handles:
@@ -624,7 +800,9 @@ for handle in handles:
     dpg.bind_item_handler_registry(f"{handle}_action", f"{handle}_handler")
 
 # draw ui
-dpg.create_viewport(title = 'Visualizer UI - DPG', width = 1545 + 15, height = 700 + 35, x_pos = 380, y_pos = 125)
+dpg.create_viewport(title = 'Visualizer UI - DPG', width = 1545 + 15, height = 715 + 35)
+dpg.set_viewport_pos((360, 165))
+
 dpg.setup_dearpygui()
 dpg.show_viewport()
 
